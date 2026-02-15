@@ -8,7 +8,7 @@ import csv
 import torch.nn as nn
 from torch.distributions import MultivariateNormal
 from torch.distributions import Categorical
-from src.mocap2combat.utils.logger import Logger
+from src.mocap2combat.utils.logger import logger
 from safetensors.torch import save_file, load_file
 from src.mocap2combat.network.mlp import MLP
 from src.mocap2combat.network.sequence import RNNNet
@@ -41,32 +41,77 @@ class RolloutBuffer:
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, state_dim, action_dims, n_actions_per_dim=4):
+        """
+        action_dims = 22 for MultiDiscrete([4]*22)
+        n_actions_per_dim = 4
+        """
         super().__init__()
+        self.action_dims = action_dims
+        self.n_actions_per_dim = n_actions_per_dim
 
-        # actor outputs logits (no softmax here)
-        self.actor = MLP(state_dim, hidden_sizes=[512, 256, 64, 64], output_size=action_dim, activation=nn.Tanh)
+        # actor outputs (action_dims * n_actions_per_dim) logits
+        self.actor = MLP(
+            state_dim,
+            hidden_sizes=[512, 256, 64, 64],
+            output_size=action_dims * n_actions_per_dim,
+            activation=nn.Tanh
+        )
 
-        # critic outputs value
-        self.critic = MLP(state_dim, hidden_sizes=[512, 256, 128, 64], output_size=1, activation=nn.Tanh)
+        self.critic = MLP(
+            state_dim,
+            hidden_sizes=[512, 256, 128, 64],
+            output_size=1,
+            activation=nn.Tanh
+        )
+
+    def _dist(self, state):
+        # logits: (B, action_dims*n_actions_per_dim) or (action_dims*n_actions_per_dim,)
+        logits = self.actor(state)
+
+        if logits.dim() == 1:
+            logits = logits.view(self.action_dims, self.n_actions_per_dim)          # (22,4)
+        else:
+            logits = logits.view(-1, self.action_dims, self.n_actions_per_dim)      # (B,22,4)
+
+        return logits
 
     def act(self, state):
-        logits = self.actor(state)
-        dist = Categorical(logits=logits)   # <-- no need for Softmax
+        logits = self._dist(state)  # (22,4)
+        dists = [Categorical(logits=logits[i]) for i in range(self.action_dims)]
 
-        action = dist.sample()
-        action_logprob = dist.log_prob(action)
+        actions = torch.stack([d.sample() for d in dists], dim=0)                  # (22,)
+        logprob = torch.stack([d.log_prob(a) for d, a in zip(dists, actions)]).sum()
+        entropy = torch.stack([d.entropy() for d in dists]).sum()
+
         state_val = self.critic(state)
 
-        return action.detach(), action_logprob.detach(), state_val.detach()
-    
-    def evaluate(self, state, action):
-        action_probs = self.actor(state)
-        dist = Categorical(action_probs)
-        action_logprobs = dist.log_prob(action)
-        dist_entropy = dist.entropy()
-        state_values = self.critic(state)        
+        return actions.detach(), logprob.detach(), state_val.detach(), entropy.detach()
+
+    def evaluate(self, states, actions):
+        """
+        states:  (T,B?) usually (T, state_dim) in your code => (N,state_dim)
+        actions: (N, action_dims)  long
+        """
+        logits = self._dist(states)  # (N,22,4)
+
+        # build per-dim distributions across the batch
+        # logits[:, i, :] is (N,4)
+        logprob_list = []
+        entropy_list = []
+
+        for i in range(self.action_dims):
+            dist_i = Categorical(logits=logits[:, i, :])
+            logprob_list.append(dist_i.log_prob(actions[:, i]))
+            entropy_list.append(dist_i.entropy())
+
+        action_logprobs = torch.stack(logprob_list, dim=1).sum(dim=1)  # (N,)
+        dist_entropy   = torch.stack(entropy_list, dim=1).sum(dim=1)   # (N,)
+
+        state_values = self.critic(states).squeeze(-1)                 # (N,)
+
         return action_logprobs, state_values, dist_entropy
+
     
 
 
@@ -99,18 +144,19 @@ class PPO:
         return len(self.buffer)
 
     def select_action(self, state):
-
         with torch.no_grad():
-            state = torch.FloatTensor(state).to(self.device)
-            action, action_logprob, state_val = self.policy_old.act(state)
-            
-            self.buffer.states.append(state)
-            self.buffer.actions.append(action)
-            self.buffer.logprobs.append(action_logprob)
-            self.buffer.state_values.append(state_val)
+            state_t = torch.FloatTensor(state).to(self.device)
 
-            action = action.item()
-            return action, action_logprob, state_val
+            action_vec, action_logprob, state_val, _ = self.policy_old.act(state_t)
+
+            self.buffer.states.append(state_t)
+            self.buffer.actions.append(action_vec)        # IMPORTANT: store vector (22,)
+            self.buffer.logprobs.append(action_logprob)   # scalar
+            self.buffer.state_values.append(state_val)    # (1,) or scalar
+
+            # env.step expects array-like of shape (22,)
+            return action_vec.cpu().numpy(), action_logprob, state_val
+
 
     def update(self):
         # Monte Carlo estimate of returns
@@ -127,10 +173,13 @@ class PPO:
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
 
         # convert list to tensor
-        old_states = torch.squeeze(torch.stack(self.buffer.states, dim=0)).detach().to(self.device)
-        old_actions = torch.squeeze(torch.stack(self.buffer.actions, dim=0)).detach().to(self.device)
-        old_logprobs = torch.squeeze(torch.stack(self.buffer.logprobs, dim=0)).detach().to(self.device)
-        old_state_values = torch.squeeze(torch.stack(self.buffer.state_values, dim=0)).detach().to(self.device)
+        old_states = torch.stack(self.buffer.states, dim=0).detach().to(self.device)        # (N, state_dim)
+        old_actions = torch.stack(self.buffer.actions, dim=0).detach().to(self.device)      # (N, 22)
+        old_actions = old_actions.long()
+
+        old_logprobs = torch.stack(self.buffer.logprobs, dim=0).detach().to(self.device)    # (N,)
+        old_state_values = torch.stack(self.buffer.state_values, dim=0).detach().to(self.device).squeeze(-1)  # (N,)
+
 
         # calculate advantages
         #logger.info(f"rewards shape: {rewards.shape}, old_state_values shape: {old_state_values.shape}")
