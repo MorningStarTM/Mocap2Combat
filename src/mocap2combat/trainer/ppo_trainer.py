@@ -322,7 +322,7 @@ class PPOTrainer:
         
         while time_step <= self.config['max_training_timesteps']:
 
-            state, _ = self.env.reset()
+            state = self.env.reset()
             self._reset_episode_monitoring()
             self._maybe_enable_damage_proxy_from_obs(state)
             current_ep_reward = 0
